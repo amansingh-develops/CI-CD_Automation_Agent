@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+langgraph
+gitpython
+pydantic
+python-dotenv
+pytest
+pylint
+mypy
+pyflakes
+docker
+openai
+httpx

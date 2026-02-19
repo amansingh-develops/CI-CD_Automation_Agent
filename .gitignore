@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+.env.*
+
+# Specialized Artifacts
+brain/
+artifacts/
+workspace/
+.system_generated/
+*.log
+results.json
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

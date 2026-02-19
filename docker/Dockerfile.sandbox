@@ -1,0 +1,43 @@
+# Dockerfile.sandbox — Multi-Runtime Sandbox Image
+# ==================================================
+#
+# PURPOSE:
+#   Provides runtime environments for executing repository builds and tests.
+#   This image supplies runtimes ONLY — no application logic lives here.
+#
+# DESIGN PRINCIPLES:
+#   - Image provides runtimes only (Node, Python, Java, Go, Rust)
+#   - Behavior is determined by command_resolver, not baked into the image
+#   - Containers are EPHEMERAL — created and destroyed each iteration
+#   - Workspace is MOUNTED as a volume, never copied into the image
+#   - No repo cloning happens inside the container
+#   - Keep image lean to reduce cold start time (target: < 5s)
+#
+# RUNTIME SUPPORT:
+#   - Python 3.x + pip
+#   - Node.js LTS + npm
+#   - OpenJDK + Maven/Gradle
+#   - Go toolchain
+#   - Rust + Cargo
+#
+# VOLUME MOUNT:
+#   /workspace → host workspace directory (the cloned repo)
+#
+# LIFECYCLE:
+#   1. Container created with workspace mounted
+#   2. Command resolver provides build/test command
+#   3. Command executes inside container
+#   4. Logs captured by Build Executor
+#   5. Container destroyed
+
+FROM ubuntu:22.04
+
+# Placeholder — runtime installations will be added here
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+CMD ["bash"]

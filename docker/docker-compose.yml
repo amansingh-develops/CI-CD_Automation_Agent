@@ -1,0 +1,37 @@
+# Docker Compose — CI/CD Healing Agent Services
+# ================================================
+#
+# Workspace Volume Mount:
+#   The host workspace/ directory is mounted into the sandbox container
+#   at /workspace. This allows the executor to operate on cloned repos
+#   without copying files into the container.
+#
+# Container-Per-Iteration Lifecycle:
+#   Each healing loop iteration spins up a fresh container.
+#   The container executes build/test commands and is then destroyed.
+#   This prevents state leakage between iterations.
+#
+# Resource Limits Philosophy:
+#   Containers should be resource-constrained to prevent runaway builds.
+#   Memory and CPU limits will be configured per project type.
+#   Default: 2GB memory, 2 CPU cores.
+#
+# Network Isolation:
+#   Sandbox containers should have restricted network access.
+#   Package installation may require network; test execution should not.
+#   Consider two-phase approach: install (network on) → test (network off).
+
+version: '3.8'
+
+services:
+  # Sandbox container for executing builds and tests
+  agent-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    volumes:
+      - ../workspace:/workspace # Mount host workspace into container
+    working_dir: /workspace
+    # mem_limit: 2g               # Uncomment when resource limits are ready
+    # cpus: '2.0'                 # Uncomment when resource limits are ready
+    # network_mode: none          # Uncomment for test-phase network isolation
