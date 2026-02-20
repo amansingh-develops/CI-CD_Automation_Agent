@@ -1,81 +1,101 @@
-# Autonomous CI/CD Healing Agent (Backend)
+# Autonomous CI/CD Healing Agent (Monorepo)
 
-## Project Overview
+An intelligent, autonomous DevOps agent designed to detect, diagnose, and fix CI/CD failures automatically. This monorepo contains both the high-performance Python backend and the modern Cyberpunk-themed React dashboard.
 
-An intelligent backend system that automatically detects, fixes, and verifies CI/CD failures in GitHub repositories. The agent clones a repo, executes builds inside a Docker sandbox, extracts failures from runtime logs, generates minimal LLM-powered fixes, and iterates until CI passes or retries are exhausted.
+## 🚀 Key Features
 
-## Execution-Driven Architecture
+- **Execution-Driven Healing**: Errors are discovered by running the project in a Docker sandbox, ensuring 100% runtime accuracy.
+- **Multi-Provider LLM Routing**: 
+    - **Groq (Primary)**: High-speed, high-reliability engine for instant fixes.
+    - **Gemini (Fallback)**: Advanced reasoning as a robust backup.
+    - **OpenRouter (Deep Fallback)**: Access to various models with specialized 30s timeout and optimized retry handling.
+- **Intelligent Throttling**: 6s inter-request delay to maximize reliability on free-tier rate limits.
+- **Partial State Preservation**: Dashboard preserves all work (bugs found, commits made) even if an API run times out.
+- **Cyberpunk Dashboard**: Real-time visual monitoring with Framer Motion animations and neon-glow aesthetics.
 
-The core philosophy is **execution-first**: errors are discovered by running the project, not by statically analysing the repository. Static analysis may assist but never drives the workflow.
+---
 
-**Primary loop:** `Clone → Build → Detect → Fix → Commit → Push → Monitor CI → Repeat`
+## 🏗️ Project Structure
 
-## Execution Contract Overview
+The project is organized as a monorepo for a unified development experience:
 
-The system enforces strict separation between its processing layers:
-
-| Layer          | Responsibility          | Does NOT                          |
-|----------------|-------------------------|-----------------------------------|
-| **Executor**   | Runs builds in sandbox  | Fix code, commit, interpret errors |
-| **Parser**     | Normalises logs → BugReports | Use LLM, generate output strings |
-| **Fix Agent**  | Generates minimal diffs | Format output strings, commit     |
-| **Git Agent**  | Branch, commit, push    | Fix code, run builds              |
-| **Orchestrator** | Controls retry loop   | Directly fix or execute           |
-
-Full typed contracts: [`EXECUTION_CONTRACT.md`](app/executor/EXECUTION_CONTRACT.md)
-
-## Workspace Reuse Strategy
-
-- Repository cloned **once** into `workspace/<repo-name>/`
-- Workspace **reused** across all iterations
-- Workspace **mounted** into Docker containers as a volume
-- Never re-cloned per iteration; never cloned inside containers
-
-## Docker Sandbox
-
-- Ephemeral containers created per iteration
-- Multi-runtime base image (Node, Python, Java, Go, Rust)
-- Workspace mounted at `/workspace`
-- Container destroyed after each execution
-- See [`docker/Dockerfile.sandbox`](docker/Dockerfile.sandbox)
-
-## LLM Minimal Fix Philosophy
-
-- **Adaptive context**: start small (±3 lines), escalate on failure
-- **Provider fallback**: Gemini primary → Groq fallback
-- **Confidence gating**: fixes below threshold rejected before commit
-- **Minimal diff**: only fix reported lines, never refactor
-
-## Folder Structure
-
-| Directory       | Purpose                                        |
-|-----------------|------------------------------------------------|
-| `app/api`       | FastAPI endpoints (run-agent, status, results) |
-| `app/agents`    | Orchestrator, fix, git, CI monitor agents      |
-| `app/executor`  | Docker build executor (heart of system)        |
-| `app/parser`    | Runtime log → BugReport extractor              |
-| `app/core`      | Constants, config, output formatter            |
-| `app/services`  | Repo cloning, caching, results writing         |
-| `app/models`    | Typed Pydantic objects                         |
-| `app/state`     | Shared agent state (LangGraph TypedDict)       |
-| `app/llm`       | Provider abstraction + routing                 |
-| `app/utils`     | Path helpers, ignore rules                     |
-| `app/skills`    | Domain-specific fix prompts                    |
-| `docker/`       | Dockerfile.sandbox, docker-compose             |
-| `workspace/`    | Cloned repos (mounted into containers)         |
-| `tests/`        | Pytest test suite                              |
-| `scripts/`      | Bootstrap, run, and build scripts              |
-
-## Setup
-
-1. `pip install -r requirements.txt`
-2. Create `.env` from `.env.example`
-3. Build sandbox: `./scripts/build_sandbox.sh`
-
-## Run
-
-```bash
-python main.py
-# or
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
+/
+├── backend/                # FastAPI Application
+│   ├── app/                # Core logic (Agents, Executor, Parser, LLM)
+│   ├── docker/             # Docker sandbox configurations
+│   ├── workspace/          # Local mounting point for repo analysis
+│   └── tests/              # Comprehensive Pytest suite
+├── frontend/               # React (Vite) + Tailwind Dashboard
+│   ├── src/                # Modern UI components and state logic
+│   └── plugins/            # Visual-edits build system enhancements
+└── scripts/                # Unified bootstrap and utility scripts
+```
+
+---
+
+## 🛠️ Reliability & Performance
+
+### Provider Routing Logic
+The system implements a sophisticated fallback chain:
+1. **Groq**: Primary provider for speed.
+2. **Gemini**: Fallback if Groq is rate-limited (429).
+3. **OpenRouter**: Secondary fallback utilizing `stepfun/step-3.5-flash:free` with a strict **30s timeout** and single-retry policy to ensure the pipeline never stalls.
+
+### Fault Tolerance
+- **API Guardrails**: Hard 480s ceiling for API requests.
+- **Instant Push on Timeout**: If a run exceeds the timeout, the system automatically pushes all successful commits to GitHub BEFORE returning, ensuring no effort is wasted.
+- **State Checkpoints**: The Orchestrator maintains an internal `_partial_state` updated after every successful fix.
+
+---
+
+## 💻 Tech Stack
+
+### Backend
+- **FastAPI**: Asynchronous API layer for high concurrency.
+- **Pydantic**: Strict data validation and schema enforcement.
+- **Docker SDK**: Native container orchestration for isolated execution.
+- **LangGraph-inspired State**: Deterministic agent state management.
+
+### Frontend
+- **React (Vite)**: Lighting-fast development and build cycles.
+- **Tailwind CSS**: Utility-first styling with a custom Cyberpunk theme.
+- **Framer Motion**: Smooth, declarative animations.
+- **Lucide React**: Premium icon set for a sleek interface.
+
+---
+
+## ⚙️ Setup & Installation
+
+### Backend Setup
+1. Navigate to `backend/`
+2. `pip install -r requirements.txt`
+3. Create a `.env` file (see `.env.example`):
+   ```env
+   GITHUB_TOKEN=your_token
+   GROQ_API_KEY=your_key
+   GEMINI_API_KEY=your_key
+   OPENROUTER_API_KEY=your_key
+   ```
+4. Build the Docker sandbox image: `./scripts/build_sandbox.sh`
+5. Run the server: `python main.py` (or `uvicorn main:app --port 8000`)
+
+### Frontend Setup
+1. Navigate to `frontend/`
+2. `npm install`
+3. Create a `.env` (or let it use defaults): `REACT_APP_BACKEND_URL=http://localhost:8000`
+4. Run the development server: `npm run dev`
+
+---
+
+## 🧪 Verification
+
+Run the full test suite to verify backend stability:
+```bash
+cd backend
+python -m pytest tests/test_fix_agent_basic.py tests/test_orchestrator.py
+```
+
+---
+
+*Powered by Autonomous DevOps — Unifying code and automation.*
