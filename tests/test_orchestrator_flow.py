@@ -84,6 +84,7 @@ def test_retry_stops_at_limit(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container", return_value=_fail_exec()), \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha1"), \
              patch.object(orchestrator.ci_monitor, "poll_status", new_callable=AsyncMock, return_value="failure"):
@@ -121,6 +122,7 @@ def test_repeated_fixes_skipped(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container", return_value=_fail_exec()), \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha1"), \
              patch.object(orchestrator.ci_monitor, "poll_status", new_callable=AsyncMock, return_value="failure"):
@@ -154,6 +156,7 @@ def test_commit_conditions_enforced(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container", return_value=_fail_exec()), \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix") as mock_apply, \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push") as mock_push:
 
             bug = _make_bug()
@@ -235,6 +238,7 @@ def test_confidence_gating_reverts(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha1"), \
              patch.object(orchestrator.ci_monitor, "poll_status", new_callable=AsyncMock, return_value="failure"):
@@ -367,6 +371,7 @@ def test_fix_then_pass(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha123"), \
              patch.object(orchestrator.ci_monitor, "poll_status", new_callable=AsyncMock, return_value="success"):

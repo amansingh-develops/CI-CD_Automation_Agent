@@ -186,3 +186,26 @@ def detect_multi_project(workspace_path: str, max_depth: int = 2) -> list[Projec
     # Sort: root first, then alphabetically
     contexts.sort(key=lambda c: (0 if c.path == "." else 1, c.path))
     return contexts
+
+
+def resolve_docker_image(project_type: Optional[str]) -> str:
+    """
+    Map a detected project type to its language-appropriate Docker image.
+
+    Parameters
+    ----------
+    project_type : str | None
+        Detected project type from ``detect_project_type``.
+
+    Returns
+    -------
+    str
+        Docker image name. Falls back to ``DOCKER_IMAGE`` if project type is
+        unknown or not in the image map.
+    """
+    from app.core.config import DOCKER_IMAGE, DOCKER_IMAGE_MAP
+
+    if project_type and project_type in DOCKER_IMAGE_MAP:
+        return DOCKER_IMAGE_MAP[project_type]
+    return DOCKER_IMAGE
+

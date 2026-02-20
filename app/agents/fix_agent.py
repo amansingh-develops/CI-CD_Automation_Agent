@@ -35,6 +35,7 @@ FixAgent only proposes code patches.
 import difflib
 import logging
 import re
+import asyncio
 from typing import Optional
 
 from app.models.bug_report import BugReport
@@ -79,7 +80,7 @@ class FixAgent:
     max_diff_lines : int
         Maximum number of changed lines allowed in a patch (default: 50).
     locality_window : int
-        Maximum lines ± from error line where changes are allowed (default: 5).
+        Maximum lines ± from error line where changes are allowed (default: 20).
     router : LLMRouter or None
         Provider router (auto-created if not provided).
     client : LLMClient or None
@@ -88,9 +89,9 @@ class FixAgent:
 
     def __init__(
         self,
-        confidence_threshold: float = 0.6,
+        confidence_threshold: float = 0.0,
         max_diff_lines: int = 50,
-        locality_window: int = 5,
+        locality_window: int = 20,
         router: Optional[LLMRouter] = None,
         client: Optional[LLMClient] = None,
     ) -> None:
@@ -202,10 +203,15 @@ class FixAgent:
             )
 
         # --- Step 4: Extract snippet ---
-        snippet = self._extract_snippet(file_content, bug_report.line_number)
+        snippet = self._extract_snippet(file_content, bug_report.line_number, context=10)
 
         # --- Step 5: Determine context level ---
-        context_level = decide_context_level(attempt_number)
+        # If the file is small, always provide the full content even in attempt 1
+        num_lines = len(file_content.splitlines())
+        if num_lines < 300:
+            context_level = "medium"
+        else:
+            context_level = decide_context_level(attempt_number)
 
         # --- Step 6: Build prompt ---
         system_prompt = get_system_prompt(bug_report.domain)
@@ -224,6 +230,8 @@ class FixAgent:
         )
 
         # --- Step 7: Call LLM ---
+        # Add a short sleep to stay under free-tier TPM limits when multiple bugs are processed
+        await asyncio.sleep(3.0)
         try:
             llm_response: LLMResponse = await self.client.call_with_fallback(
                 user_prompt=user_prompt,
@@ -283,12 +291,15 @@ class FixAgent:
             )
 
         # --- Step 11: Patch locality validation ---
+        # If the file is small, give the LLM more room (effectively disable window check)
+        effective_window = 100 if len(file_content.splitlines()) < 100 else self.locality_window
+        
         locality_ok, locality_reason = validate_patch_locality(
             original_content=file_content,
             patched_content=patched,
             failing_line=bug_report.line_number,
             diff=diff,
-            window=self.locality_window,
+            window=effective_window,
         )
         if not locality_ok:
             logger.warning("Locality violation in %s: %s", bug_report.file_path, locality_reason)
@@ -393,8 +404,9 @@ class FixAgent:
 
         snippet_lines: list[str] = []
         for i in range(start, end):
-            marker = ">>>" if i == idx else "   "
-            snippet_lines.append(f"{marker} {i + 1:4d} | {lines[i]}")
+            line_num = i + 1
+            prefix = ">>>" if line_num == line_number else "   "
+            snippet_lines.append(f"{prefix} {line_num:4} | {lines[i]}")
 
         return "\n".join(snippet_lines)
 

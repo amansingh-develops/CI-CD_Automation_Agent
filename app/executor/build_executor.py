@@ -148,7 +148,8 @@ def _build_shell_command(commands: ResolvedCommands) -> str:
     parts.append(f"echo '>>> INSTALL' && {commands.install_command}")
     if commands.build_command:
         parts.append(f"echo '>>> BUILD' && {commands.build_command}")
-    parts.append(f"echo '>>> TEST' && {commands.test_command}")
+    # Disable exit-on-error for the test command so we capture all failures
+    parts.append(f"set +e && echo '>>> TEST' && {commands.test_command}")
     return " && ".join(parts)
 
 
@@ -245,6 +246,7 @@ def run_in_container(
             volumes={
                 workspace_path: {"bind": "/workspace", "mode": "rw"},
             },
+            environment={"CI": "true"},
             working_dir=container_workdir,
             mem_limit=_MEMORY_LIMIT,
             nano_cpus=_CPU_COUNT * 1_000_000_000,
@@ -315,3 +317,101 @@ def run_in_container(
     )
 
     return result
+
+
+def run_ci_stages(
+    workspace_path: str,
+    stages: list[tuple[str, str]],
+    project_type: Optional[str] = None,
+    timeout_seconds: int = DEFAULT_EXECUTION_TIMEOUT,
+    docker_image: str = DOCKER_IMAGE,
+) -> ExecutionResult:
+    """
+    Execute multiple CI stages sequentially and combine their results.
+
+    Each stage runs as a separate ``run_in_container`` call with a
+    custom command. All logs are concatenated with stage headers.
+    The combined exit code is non-zero if ANY stage failed.
+
+    Parameters
+    ----------
+    workspace_path : str
+        Absolute path to the cloned repository on host.
+    stages : list[tuple[str, str]]
+        List of (label, shell_command) pairs from ``resolve_from_ci_config``.
+    project_type : str | None
+        Detected project type.
+    timeout_seconds : int
+        Max execution time per stage.
+    docker_image : str
+        Docker image for sandbox containers.
+
+    Returns
+    -------
+    ExecutionResult
+        Combined result from all stages.
+    """
+    combined_result = ExecutionResult()
+    combined_result.detected_project_type = project_type
+    all_logs: list[str] = []
+    total_time = 0.0
+    worst_exit = 0
+    start_time = time.monotonic()
+
+    logger.info(
+        "[CI_STAGES] Running %d stages for %s project",
+        len(stages), project_type or "unknown",
+    )
+
+    for i, (label, command) in enumerate(stages, 1):
+        logger.info("[CI_STAGES] Stage %d/%d: %s", i, len(stages), label)
+
+        # Per-stage timeout: divide remaining time, minimum 30s
+        elapsed_total = time.monotonic() - start_time
+        remaining = max(30, timeout_seconds - elapsed_total)
+
+        stage_result = run_in_container(
+            workspace_path=workspace_path,
+            project_type=project_type,
+            timeout_seconds=int(remaining),
+            docker_image=docker_image,
+            custom_command=command,
+        )
+
+        # Collect logs with stage header
+        stage_header = f"\n{'='*60}\n>>> STAGE: {label}\n>>> COMMAND: {command}\n{'='*60}\n"
+        all_logs.append(stage_header)
+        all_logs.append(stage_result.full_log or "")
+
+        # Track total time
+        total_time += stage_result.execution_time_seconds
+
+        # Track worst exit code
+        if stage_result.exit_code != 0:
+            worst_exit = stage_result.exit_code
+            all_logs.append(f"\n>>> STAGE {label}: FAILED (exit {stage_result.exit_code})\n")
+        else:
+            all_logs.append(f"\n>>> STAGE {label}: PASSED\n")
+
+        # If there was an infrastructure error, note it but continue
+        if stage_result.error:
+            all_logs.append(f">>> STAGE ERROR: {stage_result.error}\n")
+            if not combined_result.error:
+                combined_result.error = stage_result.error
+
+        # Preserve the last resolved commands
+        if stage_result.resolved_commands:
+            combined_result.resolved_commands = stage_result.resolved_commands
+
+    # Combine all logs
+    combined_result.full_log = "\n".join(all_logs)
+    combined_result.log_excerpt = create_log_excerpt(combined_result.full_log)
+    combined_result.exit_code = worst_exit
+    combined_result.execution_time_seconds = round(total_time, 3)
+
+    logger.info(
+        "[CI_STAGES] All stages complete | exit=%d | time=%.2fs | stages=%d",
+        combined_result.exit_code, combined_result.execution_time_seconds, len(stages),
+    )
+
+    return combined_result

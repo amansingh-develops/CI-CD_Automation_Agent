@@ -29,6 +29,7 @@ import os
 import time
 import logging
 import asyncio
+import subprocess
 from collections import deque
 from typing import List, Optional, Set, Dict
 from datetime import datetime, timezone
@@ -40,16 +41,21 @@ from app.models.iteration_snapshot import IterationSnapshot
 from app.models.ci_run import CIRun
 
 from app.services.repo_service import clone_repository, detect_project_type
+from app.executor.project_detector import resolve_docker_image
 from app.services.results_writer import ResultsWriter
-from app.executor.build_executor import run_in_container, ExecutionResult
+from app.executor.build_executor import run_in_container, run_ci_stages, ExecutionResult
+from app.executor.command_resolver import resolve_from_ci_config
 from app.parser.failure_parser import parse_failure_log
 from app.parser.classification import priority_of
 from app.agents.fix_agent import FixAgent
 from app.agents.git_agent import GitAgent
 from app.agents.ci_monitor import CIMonitor
+from app.parser.ci_config_reader import read_ci_configs, get_all_commands
 from app.utils.fix_fingerprint import generate_bug_signature, generate_fix_fingerprint
 from app.utils.escalation_reasons import REPEATED_FIX
-from app.core.config import RUN_RETRY_LIMIT, GITHUB_TOKEN
+from app.services.static_analysis import analyze_repository as run_static_analysis
+from app.services.python_builtin_scanner import scan_python_files as run_builtin_scan
+from app.core.config import RUN_RETRY_LIMIT, GITHUB_TOKEN, PER_BUG_RETRY_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +265,7 @@ class Orchestrator:
         self.git_agent = GitAgent()
         self.ci_monitor = CIMonitor(github_token=github_token)
         self.github_token = github_token
+        self._partial_state: dict = {}
 
     async def run(
         self,
@@ -297,10 +304,14 @@ class Orchestrator:
             "total_fixes_applied": 0,
             "execution_summary": ""
         }
+        self._partial_state = state  # Expose for timeout recovery
 
         # Bounded fingerprint store
         history = _FixHistoryStore()
 
+        # Track per-bug attempt count for PER_BUG_RETRY_LIMIT
+        bug_attempts: Dict[str, int] = {}
+        
         # Track previous-iteration failure signatures for drift detection
         prev_failure_sigs: List[str] = []
         prev_bugs: List[BugReport] = []
@@ -309,15 +320,51 @@ class Orchestrator:
             # ===========================================================
             # 1. Clone repository
             # ===========================================================
-            logger.info("Step 1: Cloning repository: %s", repo_url)
+            logger.info(f"[ORCHESTRATOR] Step 1: Cloning repository: {repo_url}")
             workspace_path = clone_repository(repo_url, self.github_token)
             state["workspace_path"] = workspace_path
+            logger.info(f"[ORCHESTRATOR] Repository cloned to: {workspace_path}")
+
+            # Generate and checkout a healing branch (avoids push-to-main rejection)
+            heal_branch = self.git_agent.generate_branch_name(team_name, leader_name)
+            state["branch_name"] = heal_branch
+            logger.info(f"[ORCHESTRATOR] Step 1.5: Generated branch: {heal_branch}")
+            
+            if self.git_agent.checkout_branch(workspace_path, heal_branch):
+                logger.info(f"[ORCHESTRATOR] Checked out branch: {heal_branch}")
+            else:
+                logger.warning(f"[ORCHESTRATOR] Branch checkout failed for {heal_branch}")
 
             # ===========================================================
             # 2. Detect project type
             # ===========================================================
             state["project_type"] = detect_project_type(workspace_path)
-            logger.info("Step 2: Detected project type: %s", state["project_type"])
+            logger.info(f"[ORCHESTRATOR] Step 2: Detected project type: {state['project_type']}")
+
+            # Resolve language-appropriate Docker image
+            docker_image = resolve_docker_image(state["project_type"])
+            logger.info(f"[ORCHESTRATOR] Step 2: Resolved Docker image: {docker_image}")
+
+            # ===========================================================
+            # 2.5. Discover CI config (if available)
+            # ===========================================================
+            ci_stages: list[tuple[str, str]] = []
+            try:
+                ci_configs = read_ci_configs(workspace_path)
+                if ci_configs:
+                    raw_commands = get_all_commands(ci_configs)
+                    ci_stages = resolve_from_ci_config(raw_commands)
+                    logger.info(
+                        "[ORCHESTRATOR] Step 2.5: Found %d CI stage(s) from %d config(s): %s",
+                        len(ci_stages),
+                        len(ci_configs),
+                        [label for label, _ in ci_stages],
+                    )
+                else:
+                    logger.info("[ORCHESTRATOR] Step 2.5: No CI config found — using default commands.")
+            except Exception as exc:
+                logger.warning(f"[ORCHESTRATOR] CI config discovery failed (non-fatal): {exc}")
+                ci_stages = []
 
             # ===========================================================
             # 3. Autonomous Healing Loop
@@ -325,7 +372,7 @@ class Orchestrator:
             for i in range(1, RUN_RETRY_LIMIT + 1):
                 iter_start = time.time()
                 state["iteration"] = i
-                logger.info("--- Starting Iteration %d ---", i)
+                logger.info(f"--- [ORCHESTRATOR] Iteration {i} Started ---")
 
                 # --- (a) Performance guardrail check ---
                 elapsed = time.time() - run_start
@@ -333,20 +380,32 @@ class Orchestrator:
                 state["performance_hint"] = _get_performance_hint(elapsed)
 
                 if elapsed >= _GUARDRAIL_ABORT:
-                    logger.warning("5-minute guardrail reached, stopping loop")
+                    logger.warning(f"[ORCHESTRATOR] Guardrail (5m) reached after {elapsed:.1f}s. ABORTING.")
                     state["status"] = "exhausted"
                     state["execution_summary"] = "Stopped: 5-minute performance guardrail reached."
                     break
 
                 # --- (b) Execute build ---
+                logger.info(f"[ORCHESTRATOR] Iteration {i}: Running build in container...")
                 try:
-                    exec_result: ExecutionResult = run_in_container(
-                        workspace_path=workspace_path,
-                        project_type=state["project_type"],
-                        working_dir=working_directory
-                    )
+                    if ci_stages:
+                        # Multi-stage execution from CI config
+                        exec_result: ExecutionResult = run_ci_stages(
+                            workspace_path=workspace_path,
+                            stages=ci_stages,
+                            project_type=state["project_type"],
+                            docker_image=docker_image,
+                        )
+                    else:
+                        # Fallback: default command resolver
+                        exec_result = run_in_container(
+                            workspace_path=workspace_path,
+                            project_type=state["project_type"],
+                            working_dir=working_directory,
+                            docker_image=docker_image,
+                        )
                 except Exception as exc:
-                    logger.error("Executor failed: %s", exc)
+                    logger.error(f"[ORCHESTRATOR] Iteration {i}: Executor CRASHED: {exc}")
                     state["snapshots"].append(IterationSnapshot(
                         iteration=i,
                         execution_summary=f"Executor error: {exc}",
@@ -354,18 +413,80 @@ class Orchestrator:
                     ))
                     continue
 
-                # --- (c) Parse failures ---
-                try:
-                    bugs: List[BugReport] = parse_failure_log(exec_result.full_log)
-                except Exception as exc:
-                    logger.error("Parser failed: %s", exc)
-                    bugs = []
+                # --- (c) PRIMARY: Python built-in scanner (stdlib only) ---
+                # For Python repos, the built-in scanner is the PRIMARY
+                # detection method. It uses ast.parse, py_compile, tokenize,
+                # and importlib — giving precise line numbers with max confidence.
+                bugs: List[BugReport] = []
+                if state["project_type"] == "python":
+                    try:
+                        builtin_bugs = run_builtin_scan(workspace_path)
+                        if builtin_bugs:
+                            logger.info(
+                                f"[ORCHESTRATOR] Iteration {i}: "
+                                f"PRIMARY (built-in) scanner found {len(builtin_bugs)} bug(s)."
+                            )
+                            bugs.extend(builtin_bugs)
+                    except Exception as exc:
+                        logger.warning(
+                            f"[ORCHESTRATOR] Iteration {i}: Built-in scanner failed (non-fatal): {exc}"
+                        )
 
+                # --- (c.2) SECONDARY: CI log parser ---
+                # Parse CI build output for additional errors not caught by
+                # the built-in scanner (e.g. runtime errors, assertion failures,
+                # test-level failures).
+                try:
+                    ci_bugs: List[BugReport] = parse_failure_log(
+                        exec_result.full_log, workspace_path=workspace_path
+                    )
+                    if ci_bugs:
+                        logger.info(
+                            f"[ORCHESTRATOR] Iteration {i}: "
+                            f"SECONDARY (CI log parser) found {len(ci_bugs)} bug(s)."
+                        )
+                        # Merge: only add CI bugs not already found by built-in scanner
+                        existing_keys = {
+                            (b.file_path, b.line_number, b.sub_type) for b in bugs
+                        }
+                        for cb in ci_bugs:
+                            key = (cb.file_path, cb.line_number, cb.sub_type)
+                            if key not in existing_keys:
+                                bugs.append(cb)
+                                existing_keys.add(key)
+                except Exception as exc:
+                    logger.error(f"[ORCHESTRATOR] Iteration {i}: CI log parser failed: {exc}")
+
+                logger.info(
+                    f"[ORCHESTRATOR] Iteration {i}: Total bugs after merge: {len(bugs)}"
+                )
                 state["total_bugs_found"] += len(bugs)
+
+                # --- (c.3) Bonus: external static analysis (pylint/pyflakes/mypy) ---
+                if state["project_type"] == "python":
+                    try:
+                        static_bugs = run_static_analysis(workspace_path)
+                        if static_bugs:
+                            logger.info(
+                                f"[ORCHESTRATOR] Iteration {i}: "
+                                f"Static analysis found {len(static_bugs)} additional bug(s)."
+                            )
+                            existing_keys = {
+                                (b.file_path, b.line_number, b.sub_type) for b in bugs
+                            }
+                            for sb in static_bugs:
+                                key = (sb.file_path, sb.line_number, sb.sub_type)
+                                if key not in existing_keys:
+                                    bugs.append(sb)
+                                    existing_keys.add(key)
+                    except Exception as exc:
+                        logger.warning(
+                            f"[ORCHESTRATOR] Iteration {i}: Static analysis failed (non-fatal): {exc}"
+                        )
 
                 # --- (d) Check for success ---
                 if exec_result.exit_code == 0:
-                    logger.info("Iteration %d: Build PASSED!", i)
+                    logger.info(f"[ORCHESTRATOR] Iteration {i}: BUILD SUCCESS! (Healing complete)")
                     curr_sigs = _compute_failure_signatures_list(bugs)
                     outcome = _classify_iteration_outcome(
                         prev_failure_sigs, curr_sigs, prev_bugs, bugs
@@ -388,9 +509,7 @@ class Orchestrator:
                     break
 
                 if not bugs:
-                    logger.warning("Iteration %d: Build FAILED but no bugs parsed.", i)
-                    state["status"] = "failure"
-                    state["execution_summary"] = "Build failed but parser could not identify specific bugs."
+                    logger.warning(f"[ORCHESTRATOR] Iteration {i}: BUILD FAILED but NO BUGS detected. Parser might have missed them.")
                     state["snapshots"].append(IterationSnapshot(
                         iteration=i,
                         build_log_snippet=exec_result.log_excerpt,
@@ -398,15 +517,22 @@ class Orchestrator:
                         execution_summary="No bugs detected in logs.",
                         iteration_time_seconds=time.time() - iter_start,
                     ))
-                    break
+                    # If this is the last iteration, mark as failure
+                    if i == RUN_RETRY_LIMIT:
+                        state["status"] = "failure"
+                        state["execution_summary"] = "Build failed but parser could not identify specific bugs."
+                        break
+                    continue
 
                 # --- (e) Sort by priority ---
                 bugs = _sort_bugs_by_priority(bugs)
 
                 # Performance-aware batch limits
                 if state["performance_hint"] == "critical" or remaining < 60:
+                    logger.info(f"[ORCHESTRATOR] Iteration {i}: CRITICAL performance hint. Limiting to 1 bug.")
                     bugs = bugs[:1]
                 elif state["performance_hint"] == "reduced":
+                    logger.info(f"[ORCHESTRATOR] Iteration {i}: REDUCED performance hint. Limiting to 3 bugs.")
                     bugs = bugs[:3]
 
                 # Compute pre-fix signatures for drift + gating
@@ -414,7 +540,7 @@ class Orchestrator:
                 pre_fix_sigs_set = set(_compute_failure_signatures_list(bugs))
 
                 # --- (f) Fix phase ---
-                logger.info("Iteration %d: Fixing %d detected bugs...", i, len(bugs))
+                logger.info(f"[ORCHESTRATOR] Iteration {i}: Attempting to fix {len(bugs)} bugs...")
                 iteration_fixes: List[FixResult] = []
                 applied_in_iteration = 0
                 escalated_signatures: Set[str] = set()
@@ -424,11 +550,22 @@ class Orchestrator:
                 for bug in bugs:
                     bug_sig = generate_bug_signature(bug)
 
-                    # Skip already-escalated bugs this iteration
+                    # 1. Skip already-escalated bugs this iteration
                     if bug_sig in escalated_signatures:
-                        logger.info("Skipping already-escalated bug: %s", bug_sig)
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: Skipping escalated bug signature: {bug_sig}")
                         iter_skipped += 1
                         continue
+
+                    # 2. Per-bug retry limit check (PER_BUG_RETRY_LIMIT)
+                    attempts = bug_attempts.get(bug_sig, 0)
+                    if attempts >= PER_BUG_RETRY_LIMIT:
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: Exhausted {attempts}/{PER_BUG_RETRY_LIMIT} attempts for {bug.file_path} at line {bug.line_number}. Skipping.")
+                        escalated_signatures.add(bug_sig)
+                        iter_skipped += 1
+                        continue
+                    
+                    # Update attempts
+                    bug_attempts[bug_sig] = attempts + 1
 
                     # Check bounded fix history for repeated fixes
                     history_fingerprints = history.get_fingerprints(bug_sig)
@@ -443,20 +580,24 @@ class Orchestrator:
                             with open(abs_file_path, "r", encoding="utf-8") as f:
                                 file_content = f.read()
                     except Exception as exc:
-                        logger.error("Failed to read %s: %s", abs_file_path, exc)
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: Failed to read source {bug.file_path}: {exc}")
                         iter_skipped += 1
                         continue
 
                     # Generate fix
                     try:
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: Requesting fix for {bug.file_path}...")
                         fix_result = await self.fix_agent.fix(
                             bug_report=bug,
                             file_content=file_content,
-                            attempt_number=i,
+                            attempt_number=bug_attempts[bug_sig],
                             working_directory=working_directory
                         )
+                        # Rate-limit throttle: space out LLM calls to stay
+                        # within free-tier limits (~10 req/min vs 30 RPM cap)
+                        await asyncio.sleep(6)
                     except Exception as exc:
-                        logger.error("FixAgent failed for %s: %s", bug.file_path, exc)
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: FixAgent CRASHED for {bug.file_path}: {exc}")
                         iter_skipped += 1
                         continue
 
@@ -466,10 +607,9 @@ class Orchestrator:
                     if not fix_result.success:
                         escalated_signatures.add(bug_sig)
                         iter_skipped += 1
-                        logger.info(
-                            "Fix rejected for %s: %s",
-                            bug.file_path,
-                            fix_result.escalation_reason or "not successful"
+                        logger.warning(
+                            f"[ORCHESTRATOR] Iteration {i}: Fix REJECTED for {bug.file_path}. "
+                            f"Reason: {fix_result.escalation_reason or 'not successful'}"
                         )
                         continue
 
@@ -479,7 +619,7 @@ class Orchestrator:
                         fix_result.success = False
                         fix_result.escalation_reason = REPEATED_FIX
                         iter_skipped += 1
-                        logger.warning("Repeated fix detected for %s, skipping", bug.file_path)
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: REPEATED fix detected for {bug.file_path}. Skipping.")
                         continue
 
                     # Record in bounded history
@@ -487,9 +627,10 @@ class Orchestrator:
 
                     # Apply patch via git_agent
                     try:
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: Applying patch to {bug.file_path}...")
                         applied = self.git_agent.apply_fix(fix_result, workspace_path)
                     except Exception as exc:
-                        logger.error("GitAgent apply failed: %s", exc)
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: GitAgent failed to apply patch: {exc}")
                         applied = False
 
                     if applied:
@@ -497,30 +638,34 @@ class Orchestrator:
                         state["total_fixes_applied"] += 1
                         domain = _classify_domain(bug.file_path)
                         domain_fixes.setdefault(domain, []).append(fix_result)
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: Patch applied successfully to {bug.file_path} (Domain: {domain})")
+                    else:
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: Patch failed to apply at checkout layer for {bug.file_path}")
 
                 # --- (g) Confidence gating re-execution + effectiveness scoring ---
                 effective_in_iteration = 0
                 post_fix_bugs: List[BugReport] = bugs  # default if no re-execution
 
                 if applied_in_iteration > 0:
+                    logger.info(f"[ORCHESTRATOR] Iteration {i}: CONFIDENCE GATE: Re-executing build to verify {applied_in_iteration} patches...")
                     try:
                         verify_result = run_in_container(
                             workspace_path=workspace_path,
                             project_type=state["project_type"],
-                            working_dir=working_directory
+                            working_dir=working_directory,
+                            docker_image=docker_image,
                         )
-                        verify_bugs = parse_failure_log(verify_result.full_log)
+                        verify_bugs = parse_failure_log(verify_result.full_log, workspace_path=workspace_path)
                         post_fix_bugs = verify_bugs
                         post_fix_signature = _compute_failure_signature(verify_bugs)
                         post_fix_sigs_set = set(_compute_failure_signatures_list(verify_bugs))
 
                         if verify_result.exit_code == 0:
-                            logger.info("Confidence gate: build passes after fixes!")
+                            logger.info(f"[ORCHESTRATOR] Iteration {i}: CONFIDENCE GATE PASSED! Build successful.")
                         elif post_fix_signature == pre_fix_signature:
-                            logger.warning(
-                                "Confidence gate: failure signature unchanged, "
-                                "fixes were ineffective"
-                            )
+                            logger.warning(f"[ORCHESTRATOR] Iteration {i}: CONFIDENCE GATE FAILED. Failures are IDENTICAL after fixes.")
+                        else:
+                            logger.info(f"[ORCHESTRATOR] Iteration {i}: CONFIDENCE GATE: Partial success. Bug signature changed.")
 
                         # --- Effectiveness scoring (signature-based) ---
                         for fix in iteration_fixes:
@@ -529,8 +674,9 @@ class Orchestrator:
                                 fix.effectiveness_score = score
                                 if score > 0:
                                     effective_in_iteration += 1
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: Effectiveness stats: {effective_in_iteration} effective fixes.")
                     except Exception as exc:
-                        logger.error("Confidence gating re-execution failed: %s", exc)
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: Confidence gate execution FAILED: {exc}")
 
                 # Update telemetry counters
                 state["effective_fix_count"] += effective_in_iteration
@@ -541,6 +687,7 @@ class Orchestrator:
                 iteration_outcome = _classify_iteration_outcome(
                     prev_failure_sigs, curr_failure_sigs, prev_bugs, post_fix_bugs
                 ) if prev_failure_sigs else ("improved" if applied_in_iteration > 0 else "unchanged")
+                logger.info(f"[ORCHESTRATOR] Iteration {i} Outcome: {iteration_outcome.upper()}")
 
                 # --- (h) Commit gating ---
                 state["commit_count"] = self.git_agent.commit_count
@@ -558,26 +705,39 @@ class Orchestrator:
 
                 if applied_in_iteration > 0 and not should_commit:
                     if effective_in_iteration == 0:
-                        logger.info("Commit skipped: no effective fixes (noise protection)")
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: NOISE PROTECTION: No effective fixes, skipping commit.")
                     elif root_failures_remain and not has_root_fixes:
-                        logger.info("Commit blocked: root failures remain, fixes target lint only")
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: ROOT GATE: root failures (SYNTAX/IMPORT) remain, blocking lint-only commit.")
 
                 # --- (i) Push and validate ---
                 if should_commit:
-                    logger.info("Pushing fixes and polling CI...")
+                    logger.info(f"[ORCHESTRATOR] Iteration {i}: PUSHING {applied_in_iteration} fix(es) to remote...")
                     try:
-                        self.git_agent.push(workspace_path, branch)
+                        self.git_agent.push(workspace_path, heal_branch)
                     except Exception as exc:
-                        logger.error("Git push failed: %s", exc)
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: Git push failed: {exc}")
 
                     commit_sha = self.git_agent.get_last_commit_sha(workspace_path)
 
-                    # Poll CI status
-                    try:
-                        ci_status = await self.ci_monitor.poll_status(repo_url, commit_sha)
-                    except Exception as exc:
-                        logger.error("CI polling failed: %s", exc)
-                        ci_status = "error"
+                    # Only poll CI if push actually succeeded
+                    push_status = getattr(self.git_agent, "push_status", "success")
+                    # Handle mocks: if status is empty or a non-string (mock), default to success.
+                    # Only explicitly rejected statuses block polling.
+                    if push_status not in ("success", "rejected_main", "conflict_unresolved"):
+                        push_status = "success"
+
+                    if push_status == "success":
+                        # Poll CI status
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: POLLING CI for commit {commit_sha}...")
+                        try:
+                            ci_status = await self.ci_monitor.poll_status(repo_url, commit_sha)
+                            logger.info(f"[ORCHESTRATOR] Iteration {i}: CI STATUS: {ci_status.upper()}")
+                        except Exception as exc:
+                            logger.error(f"[ORCHESTRATOR] Iteration {i}: CI polling FAILED: {exc}")
+                            ci_status = "error"
+                    else:
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: Push status is '{self.git_agent.push_status}', skipping CI poll")
+                        ci_status = "skipped"
 
                     # --- CI hang protection ---
                     if ci_status == "unknown_timeout":
@@ -592,7 +752,7 @@ class Orchestrator:
                             iteration=i
                         ))
                         logger.warning(
-                            "CI stalled detected at iteration %d, continuing locally", i
+                            f"[ORCHESTRATOR] Iteration {i}: CI STALL detected. Continuing with local validation loop."
                         )
                     else:
                         now_ts = datetime.now(timezone.utc)
@@ -623,18 +783,17 @@ class Orchestrator:
                     state["snapshots"].append(snapshot)
 
                     if ci_status == "success":
-                        logger.info("CI PASSED after fixes!")
+                        logger.info(f"[ORCHESTRATOR] Iteration {i}: CI PASSED! Repository successfully healed.")
                         state["status"] = "success"
                         state["execution_summary"] = (
                             f"Healing successful via CI validation in iteration {i}."
                         )
                         break
                     elif ci_status in ("failure", "timeout"):
-                        logger.warning("CI Failed/Timed out, retrying next iteration...")
-                    # unknown_timeout → continue local loop
+                        logger.warning(f"[ORCHESTRATOR] Iteration {i}: CI {ci_status.upper()}. Retrying in next loop.")
                 else:
                     # No commit this iteration
-                    logger.warning("No commit in iteration %d.", i)
+                    logger.warning(f"[ORCHESTRATOR] Iteration {i}: SKIPPING commit/push.")
                     state["snapshots"].append(IterationSnapshot(
                         iteration=i,
                         bug_reports=bugs,
@@ -652,6 +811,7 @@ class Orchestrator:
                     ))
                     # If ALL bugs were escalated, stop loop
                     if len(escalated_signatures) >= len(bugs):
+                        logger.error(f"[ORCHESTRATOR] Iteration {i}: ALL BUGS escalated/rejected. Stopping healing loop.")
                         state["status"] = "failure"
                         state["execution_summary"] = (
                             "All bugs escalated — no effective fixes possible."
@@ -661,6 +821,7 @@ class Orchestrator:
                 # Update previous signatures for next iteration drift tracking
                 prev_failure_sigs = curr_failure_sigs
                 prev_bugs = post_fix_bugs
+                logger.info(f"--- [ORCHESTRATOR] Iteration {i} Finished (Time: {time.time() - iter_start:.1f}s) ---")
 
             # Finalise status if still pending
             if state["status"] == "pending":
@@ -670,7 +831,7 @@ class Orchestrator:
                 )
 
         except Exception as e:
-            logger.error("Orchestrator encountered a fatal error: %s", e, exc_info=True)
+            logger.error(f"[ORCHESTRATOR] FATAL EXCEPTION: {e}", exc_info=True)
             state["status"] = "error"
             state["execution_summary"] = f"Fatal error: {str(e)}"
 

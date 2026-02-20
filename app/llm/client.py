@@ -33,6 +33,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+import asyncio
 import httpx
 
 from app.llm.router import ProviderConfig, LLMRouter
@@ -61,22 +62,14 @@ class LLMResponse:
 # ---------------------------------------------------------------------------
 def parse_llm_response(raw: str, provider_name: str) -> LLMResponse:
     """
-    Parse the LLM response JSON to extract patched_content and confidence_score.
+    Parse the LLM response to extract patched_content and confidence_score.
 
-    Falls back to treating the entire response as patched content if JSON
-    parsing fails, with a reduced confidence of 0.5.
+    Supports two response formats:
+        1. Code-fence format: ```python<code>``` + CONFIDENCE: <float>
+        2. JSON format: {"patched_content": "...", "confidence_score": <float>}
 
-    Parameters
-    ----------
-    raw : str
-        Raw text response from the LLM.
-    provider_name : str
-        Name of the provider that generated this response.
-
-    Returns
-    -------
-    LLMResponse
-        Parsed response with patched_content and confidence_score.
+    Falls back to treating the entire response as patched content if neither
+    format is detected, with a reduced confidence of 0.5.
     """
     if not raw or not raw.strip():
         return LLMResponse(
@@ -88,16 +81,46 @@ def parse_llm_response(raw: str, provider_name: str) -> LLMResponse:
             error="Empty response from LLM",
         )
 
-    # Try to parse as JSON
-    cleaned = raw.strip()
+    stripped = raw.strip()
 
-    # Strip markdown code fences if present
+    # ── Strategy 1: Extract from markdown code fences ──
+    fence_match = re.search(
+        r'```(?:python|py|javascript|js|typescript|ts)?\s*\n(.*?)```',
+        stripped,
+        re.DOTALL,
+    )
+    if fence_match:
+        patched = fence_match.group(1)
+        # Don't accept if it looks like JSON inside the fence
+        if not patched.strip().startswith('{'):
+            confidence = 0.7
+            conf_match = re.search(
+                r'CONFIDENCE\s*:\s*([\d.]+)',
+                stripped[fence_match.end():],
+                re.IGNORECASE,
+            )
+            if conf_match:
+                try:
+                    confidence = max(0.0, min(1.0, float(conf_match.group(1))))
+                except ValueError:
+                    confidence = 0.7
+            logger.info(
+                "Parsed code-fence response from %s (%d chars, confidence=%.2f)",
+                provider_name, len(patched), confidence,
+            )
+            return LLMResponse(
+                patched_content=patched,
+                confidence_score=confidence,
+                provider_name=provider_name,
+                raw_response=raw,
+            )
+
+    # ── Strategy 2: Parse as JSON ──
+    cleaned = stripped
     if cleaned.startswith("```"):
-        # Remove opening fence (```json or ```)
         first_newline = cleaned.find("\n")
         if first_newline != -1:
             cleaned = cleaned[first_newline + 1:]
-        # Remove closing fence
         if cleaned.rstrip().endswith("```"):
             cleaned = cleaned.rstrip()[:-3].rstrip()
 
@@ -106,30 +129,27 @@ def parse_llm_response(raw: str, provider_name: str) -> LLMResponse:
         if isinstance(data, dict):
             patched = data.get("patched_content", "")
             confidence = float(data.get("confidence_score", 0.5))
-            confidence = max(0.0, min(1.0, confidence))  # Clamp
-            return LLMResponse(
-                patched_content=patched,
-                confidence_score=confidence,
-                provider_name=provider_name,
-                raw_response=raw,
-            )
+            confidence = max(0.0, min(1.0, confidence))
+            if patched:
+                return LLMResponse(
+                    patched_content=patched,
+                    confidence_score=confidence,
+                    provider_name=provider_name,
+                    raw_response=raw,
+                )
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
-    # Try regex extraction as last resort
+    # ── Strategy 3: Regex extraction from malformed JSON ──
     patched_match = re.search(
-        r'"patched_content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*',
+        r'"patched_content"\s*:\s*"((?:[^"\\]|\\.)*)"',
         cleaned,
         re.DOTALL,
     )
-    confidence_match = re.search(
-        r'"confidence_score"\s*:\s*([\d.]+)',
-        cleaned,
-    )
+    confidence_match = re.search(r'"confidence_score"\s*:\s*([\d.]+)', cleaned)
 
     if patched_match:
         patched = patched_match.group(1)
-        # Unescape JSON string escapes
         try:
             patched = json.loads(f'"{patched}"')
         except Exception:
@@ -147,11 +167,24 @@ def parse_llm_response(raw: str, provider_name: str) -> LLMResponse:
             raw_response=raw,
         )
 
-    # Final fallback: treat entire response as patched content
-    logger.warning("Could not parse LLM JSON response, using raw text as patch")
+    # ── Strategy 4: Heuristic — if response looks like code, use it ──
+    lines = stripped.splitlines()
+    if len(lines) > 3 and any(
+        kw in stripped for kw in ('def ', 'class ', 'import ', 'from ', 'return ')
+    ):
+        logger.warning("No fence/JSON found but response looks like code (%d lines)", len(lines))
+        return LLMResponse(
+            patched_content=stripped,
+            confidence_score=0.4,
+            provider_name=provider_name,
+            raw_response=raw,
+        )
+
+    # Final fallback
+    logger.warning("Could not parse LLM response, using raw text as patch")
     return LLMResponse(
         patched_content=cleaned,
-        confidence_score=0.5,
+        confidence_score=0.3,
         provider_name=provider_name,
         raw_response=raw,
     )
@@ -296,7 +329,7 @@ class LLMClient:
     async def _get_http(self) -> httpx.AsyncClient:
         """Lazy-initialise the HTTP client."""
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
         return self._http
 
     async def close(self) -> None:
@@ -337,13 +370,31 @@ class LLMClient:
                         user_prompt, system_prompt, provider
                     )
 
+                # Fast-fail: if provider returned empty/trivial response, retry
+                if not raw or len(raw.strip()) < 20:
+                    logger.warning(
+                        "Provider %s attempt %d: near-empty response (%d chars)",
+                        provider.name, attempt, len(raw.strip()) if raw else 0,
+                    )
+                    continue  # retry instead of break
+
+                # Debug: log raw response so we can diagnose parse issues
+                logger.debug(
+                    "Provider %s raw response (first 300 chars): %s",
+                    provider.name, raw[:300],
+                )
+
                 response = parse_llm_response(raw, provider.name)
                 if response.success and response.patched_content:
                     return response
 
                 logger.warning(
-                    "Provider %s attempt %d: empty or failed response",
+                    "Provider %s attempt %d: parsed but empty "
+                    "(success=%s, patched_len=%d, error=%s)",
                     provider.name, attempt,
+                    response.success,
+                    len(response.patched_content) if response.patched_content else 0,
+                    response.error or "none",
                 )
 
             except httpx.TimeoutException:
@@ -356,11 +407,23 @@ class LLMClient:
                     "Provider %s attempt %d: HTTP %d", provider.name, attempt, status
                 )
                 if status == 429:  # Rate limit
-                    break  # Don't retry, switch provider immediately
+                    # Longer backoff to let the provider recover
+                    backoff = max(10, min(2 ** attempt, 30))
+                    logger.warning(
+                        "Rate limited by %s, backing off %ds before fallback",
+                        provider.name, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    break  # Don't retry, switch provider
             except Exception as e:
                 logger.warning(
                     "Provider %s attempt %d: %s", provider.name, attempt, e
                 )
+
+            # Backoff between retries (2s, 4s, ...)
+            if attempt < provider.max_retries:
+                backoff = min(2 ** attempt, 8)
+                await asyncio.sleep(backoff)
 
         return LLMResponse(
             patched_content="",
@@ -429,7 +492,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 8192,
+            "max_tokens": 16384,
         }
         resp = await http.post(url, json=payload, headers=headers)
         resp.raise_for_status()
@@ -453,8 +516,8 @@ class LLMClient:
         """
         Call LLM with automatic provider fallback.
 
-        Tries the primary provider first, then falls back to the next
-        healthy provider on failure.
+        Tries providers in priority order (Groq → Gemini → OpenRouter),
+        falling back to the next healthy provider on failure.
 
         Parameters
         ----------
@@ -470,28 +533,27 @@ class LLMClient:
         LLMResponse
             Response from whichever provider succeeded, or a failure response.
         """
-        primary = router.get_provider()
-        response = await self.call(user_prompt, system_prompt, primary)
+        provider = router.get_provider()
+        last_error = ""
+        tried_providers: list[str] = []
 
-        if response.success and response.patched_content:
-            router.report_success(primary.name)
-            return response
+        while provider and provider.name not in tried_providers:
+            tried_providers.append(provider.name)
+            response = await self.call(user_prompt, system_prompt, provider)
 
-        # Primary failed — try fallback
-        router.report_failure(primary.name)
-        fallback = router.get_fallback_provider(primary.name)
-
-        if fallback:
-            response = await self.call(user_prompt, system_prompt, fallback)
             if response.success and response.patched_content:
-                router.report_success(fallback.name)
+                router.report_success(provider.name)
                 return response
-            router.report_failure(fallback.name)
+
+            # This provider failed — record and try next
+            router.report_failure(provider.name)
+            last_error = response.error or f"{provider.name} failed"
+            provider = router.get_fallback_provider(*tried_providers)
 
         return LLMResponse(
             patched_content="",
             confidence_score=0.0,
-            provider_name=primary.name,
+            provider_name=tried_providers[0] if tried_providers else "unknown",
             success=False,
-            error="All providers failed",
+            error=f"All providers failed. Last error: {last_error}",
         )

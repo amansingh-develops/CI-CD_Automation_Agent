@@ -58,16 +58,22 @@ SYSTEM_PROMPT = (
     "3. Preserve ALL comments exactly as they are.\n"
     "4. Do NOT refactor, rename, or reorganise any unrelated code.\n"
     "5. Do NOT change function signatures unless the error requires it.\n"
-    "6. Do NOT change lines outside ±3 of the reported error line.\n"
-    "7. Do NOT add explanations, apologies, or markdown formatting.\n"
-    "8. Do NOT insert destructive shell commands or modify CI pipeline files.\n"
-    "9. Do NOT change dependency versions unless the error is about a missing dependency.\n"
+    "6. Do NOT add explanations, apologies, or markdown formatting outside the code block.\n"
+    "7. Do NOT insert destructive shell commands or modify CI pipeline files.\n"
+    "8. Do NOT change dependency versions unless the error is about a missing dependency.\n"
+    "9. Return the COMPLETE file with ONLY the fix applied.\n"
+    "10. CRITICAL: Your response MUST include the ENTIRE file content. Do NOT truncate, do NOT use placeholders like '// rest of code', and do NOT omit unrelated functions. If you return a truncated file, the fix will fail.\n"
     "\n"
-    "RESPONSE FORMAT — you MUST respond with ONLY valid JSON:\n"
-    '{"patched_content": "<the complete file with your fix applied>", '
-    '"confidence_score": <float between 0.0 and 1.0>}\n'
+    "RESPONSE FORMAT — respond with EXACTLY this structure:\n"
+    "```python\n"
+    "<the complete file content with your fix applied>\n"
+    "```\n"
+    "CONFIDENCE: <float between 0.0 and 1.0>\n"
     "\n"
-    "No other text. No markdown code fences. Just the JSON object."
+    "You may also respond with JSON if you prefer:\n"
+    '{"patched_content": "<the complete file>", "confidence_score": <float>}\n'
+    "\n"
+    "No explanations before or after. Just the code block (or JSON)."
 )
 
 
@@ -190,15 +196,15 @@ def build_user_prompt(
         if ci_config_hint:
             parts.append(f"CI CONFIG HINT:\n{ci_config_hint}")
 
-    # Hard rules reminder
+    # Hard rules reminder — context-aware
     parts.append(
         "INSTRUCTIONS:\n"
         "- Return the COMPLETE file content with ONLY the fix applied.\n"
-        "- Do NOT change any lines outside ±3 of the error.\n"
+        "- Do NOT change any lines outside ±15 of the error.\n"
         "- Do NOT rename variables or restructure code.\n"
         "- Preserve ALL comments.\n"
-        "- Respond with ONLY valid JSON: "
-        '{"patched_content": "...", "confidence_score": 0.0-1.0}'
+        "- Wrap your patched file in ```python code fences.\n"
+        "- After the code block, add: CONFIDENCE: <0.0-1.0>"
     )
 
     return "\n\n".join(parts)

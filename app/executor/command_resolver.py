@@ -41,7 +41,7 @@ class ResolvedCommands:
 _COMMAND_MAP: dict[str, ResolvedCommands] = {
     "python": ResolvedCommands(
         install_command="pip install -r requirements.txt",
-        test_command="pytest",
+        test_command="pytest --tb=short --continue-on-collection-errors -q",
         project_type="python",
     ),
     "node": ResolvedCommands(
@@ -108,3 +108,73 @@ def resolve_commands(project_type: Optional[str]) -> ResolvedCommands:
 def get_supported_project_types() -> list[str]:
     """Return all project types that have command mappings."""
     return sorted(_COMMAND_MAP.keys())
+
+
+def resolve_from_ci_config(ci_commands: list[tuple[str, str, str]]) -> list[tuple[str, str]]:
+    """
+    Convert CI config commands into executable (label, command) pairs.
+
+    Takes the output of ``ci_config_reader.get_all_commands()`` and groups
+    steps **by CI job name**, merging all steps for the same job into a single
+    combined shell command.  This is critical because each stage runs in its
+    own ephemeral Docker container — dependencies installed in step 1 of a job
+    must still be available in step 2.
+
+    Parameters
+    ----------
+    ci_commands : list[tuple[str, str, str]]
+        Tuples of (job_name, working_directory, run_command) from CI config.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        Tuples of (label, shell_command) ready for execution.
+        One entry per CI **job** (not per step).
+    """
+    # Skip patterns — these are not actual build/test commands
+    _SKIP_PATTERNS = [
+        "actions/checkout",
+        "actions/setup-",
+        "uses:",          # GitHub Actions action references
+    ]
+
+    # Group all steps by job name (preserving insertion order)
+    from collections import OrderedDict
+    job_commands: OrderedDict[str, list[tuple[str, str]]] = OrderedDict()
+
+    for job_name, working_dir, run_command in ci_commands:
+        # Skip empty or action-only steps
+        if not run_command or not run_command.strip():
+            continue
+
+        # Skip known non-executable patterns
+        skip = False
+        for pattern in _SKIP_PATTERNS:
+            if pattern in run_command:
+                skip = True
+                break
+        if skip:
+            continue
+
+        if job_name not in job_commands:
+            job_commands[job_name] = []
+        job_commands[job_name].append((working_dir, run_command))
+
+    # Build one combined command per job
+    result: list[tuple[str, str]] = []
+    for job_name, steps in job_commands.items():
+        label = job_name.upper().replace("-", "_").replace(" ", "_")
+
+        # Merge all steps into a single shell command
+        merged_parts: list[str] = []
+        for working_dir, run_command in steps:
+            if working_dir:
+                merged_parts.append(f"cd /workspace/{working_dir.strip('/')} && {run_command}")
+            else:
+                merged_parts.append(run_command)
+
+        combined_cmd = " && ".join(merged_parts)
+        result.append((label, combined_cmd))
+
+    return result
+

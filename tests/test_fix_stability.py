@@ -79,7 +79,7 @@ def hello():
 def goodbye():
     print("goodbye")
     return 1
-"""
+""" + "\n" * 150  # Make it > 100 lines to avoid small-file window expansion
 
 SAMPLE_PATCHED = """\
 import os
@@ -92,7 +92,7 @@ def hello():
 def goodbye():
     print("goodbye")
     return 1
-"""
+""" + "\n" * 150
 
 # Patch that modifies lines far from line 5
 SAMPLE_PATCHED_FAR = """\
@@ -106,7 +106,7 @@ def hello():
 def goodbye():
     print("goodbye, world!")
     return 42
-"""
+""" + "\n" * 150
 
 
 def _mock_response(

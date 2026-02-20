@@ -152,3 +152,45 @@ def hello():
                 f.write("print('ok')")
             
             assert has_merge_conflicts(tmp) is False
+
+
+# ===========================================================================
+# 4. Dynamic Docker Image Resolution Tests
+# ===========================================================================
+class TestDynamicDockerImages:
+
+    def test_python_image(self):
+        from app.executor.project_detector import resolve_docker_image
+        img = resolve_docker_image("python")
+        assert "python" in img
+
+    def test_node_image(self):
+        from app.executor.project_detector import resolve_docker_image
+        img = resolve_docker_image("node")
+        assert "node" in img
+
+    def test_java_image(self):
+        from app.executor.project_detector import resolve_docker_image
+        img = resolve_docker_image("java")
+        assert "maven" in img or "java" in img
+
+    def test_go_image(self):
+        from app.executor.project_detector import resolve_docker_image
+        img = resolve_docker_image("go")
+        assert "golang" in img
+
+    def test_rust_image(self):
+        from app.executor.project_detector import resolve_docker_image
+        img = resolve_docker_image("rust")
+        assert "rust" in img
+
+    def test_unknown_falls_back(self):
+        from app.executor.project_detector import resolve_docker_image
+        from app.core.config import DOCKER_IMAGE
+        assert resolve_docker_image("unknown_lang") == DOCKER_IMAGE
+
+    def test_none_falls_back(self):
+        from app.executor.project_detector import resolve_docker_image
+        from app.core.config import DOCKER_IMAGE
+        assert resolve_docker_image(None) == DOCKER_IMAGE
+

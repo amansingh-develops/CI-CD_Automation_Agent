@@ -62,6 +62,11 @@ _KEYWORD_MAP: dict[str, tuple[str, str, float, str]] = {
     # JS / Node exceptions
     "referenceerror":      ("IMPORT",      "missing_import",  CONF_HIGH,   "frontend_js"),
     "rangeerror":          ("LOGIC",       "off_by_one",      CONF_MEDIUM, "frontend_js"),
+
+    # Language-agnostic / multi-language error names
+    "compilationerror":    ("SYNTAX",      "invalid_syntax",  CONF_MEDIUM, "generic"),
+    "linterror":           ("LINTING",     "lint_violation",   CONF_HIGH,   "generic"),
+    "linkerror":           ("IMPORT",      "missing_import",  CONF_MEDIUM, "generic"),
 }
 
 

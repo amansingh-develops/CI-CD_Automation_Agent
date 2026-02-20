@@ -33,6 +33,7 @@ def test_successful_first_attempt(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.detect_project_type", return_value="python"), \
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log", return_value=[]), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch("app.agents.orchestrator.ResultsWriter.write_results") as mock_writer:
             
             # Mock a passing build (exit_code 0)
@@ -63,6 +64,7 @@ def test_fix_then_pass(orchestrator, mock_fix_agent):
              patch("os.path.exists", return_value=True), \
              patch("builtins.open", mock_open(read_data="def hello(): pass")), \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha123"), \
              patch.object(orchestrator.ci_monitor, "poll_status", return_value="success"):
@@ -99,6 +101,7 @@ def test_no_bugs_detected_early_exit(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.detect_project_type", return_value="python"), \
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log", return_value=[]), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch("app.agents.orchestrator.ResultsWriter.write_results"):
             
             mock_exec.return_value = ExecutionResult(exit_code=1, full_log="weird error")
@@ -123,6 +126,7 @@ def test_retries_exhausted(orchestrator, mock_fix_agent):
              patch("os.path.exists", return_value=True), \
              patch("builtins.open", mock_open(read_data="content")), \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push"), \
              patch.object(orchestrator.git_agent, "get_last_commit_sha", return_value="sha"), \
              patch.object(orchestrator.ci_monitor, "poll_status", return_value="failure"):

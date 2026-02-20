@@ -101,7 +101,12 @@ def _mock_llm_response(
 
 def _run(coro):
     """Run an async coroutine synchronously for testing."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +134,7 @@ class TestPatchGenerationStructure:
         assert result.success is True
         assert result.needs_escalation is False
         assert result.manual_required is False
-        assert result.context_level == "small"
+        assert result.context_level == "medium"
         assert result.provider_used == "gemini"
         assert result.patch_applied != ""
         assert result.error_message == ""
@@ -407,31 +412,32 @@ class TestProviderFallback:
     def test_fallback_on_primary_failure(self):
         router = LLMRouter()
 
-        # Make primary unhealthy
-        for _ in range(3):
-            router.report_failure("gemini")
+        # Make primary (groq) unhealthy
+        for _ in range(4):
+            router.report_failure("groq")
 
         provider = router.get_provider()
-        assert provider.name == "groq"
+        assert provider.name == "gemini"
 
     def test_get_fallback_provider(self):
         router = LLMRouter()
-        fallback = router.get_fallback_provider("gemini")
+        fallback = router.get_fallback_provider("groq")
         assert fallback is not None
-        assert fallback.name == "groq"
+        assert fallback.name == "gemini"
 
     def test_no_fallback_when_all_unhealthy(self):
         router = LLMRouter()
-        for _ in range(3):
+        for _ in range(4):
             router.report_failure("gemini")
             router.report_failure("groq")
+            router.report_failure("openrouter")
 
         fallback = router.get_fallback_provider("gemini")
         assert fallback is None
 
     def test_health_reset(self):
         router = LLMRouter()
-        for _ in range(3):
+        for _ in range(4):
             router.report_failure("gemini")
 
         health = router.get_health("gemini")
@@ -517,8 +523,8 @@ class TestPromptStructure:
 class TestContextLevelEscalation:
     """Verify attempt number drives context size."""
 
-    def test_attempt_1_is_small(self):
-        assert decide_context_level(1) == "small"
+    def test_attempt_1_is_medium(self):
+        assert decide_context_level(1) == "medium"
 
     def test_attempt_2_is_medium(self):
         assert decide_context_level(2) == "medium"
@@ -574,6 +580,20 @@ class TestLLMResponseParsing:
         assert resp.confidence_score == 0.9
         assert resp.success is True
 
+    def test_code_fence_format(self):
+        raw = "```python\nprint('fixed')\n```\nCONFIDENCE: 0.95"
+        resp = parse_llm_response(raw, "groq")
+        assert resp.patched_content == "print('fixed')\n"
+        assert resp.confidence_score == 0.95
+        assert resp.success is True
+
+    def test_code_fence_no_confidence(self):
+        raw = "```python\nprint('fixed')\n```"
+        resp = parse_llm_response(raw, "groq")
+        assert resp.patched_content == "print('fixed')\n"
+        assert resp.confidence_score == 0.7  # Default for fence
+        assert resp.success is True
+
     def test_markdown_fenced_json(self):
         raw = '```json\n{"patched_content": "fixed", "confidence_score": 0.8}\n```'
         resp = parse_llm_response(raw, "groq")
@@ -588,7 +608,7 @@ class TestLLMResponseParsing:
     def test_raw_text_fallback(self):
         resp = parse_llm_response("just some code here", "gemini")
         assert resp.patched_content == "just some code here"
-        assert resp.confidence_score == 0.5  # Fallback confidence
+        assert resp.confidence_score == 0.3  # Fallback confidence changed to 0.3
 
     def test_confidence_clamped(self):
         raw = json.dumps({"patched_content": "code", "confidence_score": 5.0})

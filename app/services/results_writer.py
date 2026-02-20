@@ -54,13 +54,22 @@ class ResultsWriter:
                 # This ensures the dashboard shows the "byte-perfect" strings
                 formatted_bugs = []
                 for bug_dict in s_dict.get("bug_reports", []):
-                    # We pass the raw fields to format_bug
-                    formatted_bugs.append(format_bug(
-                        bug_type=bug_dict["bug_type"],
-                        sub_type=bug_dict["sub_type"],
-                        file_path=bug_dict["file_path"],
-                        line_number=bug_dict["line_number"]
-                    ))
+                    try:
+                        # Clamp line_number to at least 1 (parser may emit 0)
+                        line_num = max(1, bug_dict.get("line_number", 1))
+                        formatted_bugs.append(format_bug(
+                            bug_type=bug_dict["bug_type"],
+                            sub_type=bug_dict["sub_type"],
+                            file_path=bug_dict["file_path"],
+                            line_number=line_num,
+                        ))
+                    except (ValueError, KeyError) as fmt_err:
+                        logger.warning("Skipping unformattable bug: %s", fmt_err)
+                        formatted_bugs.append(
+                            f"{bug_dict.get('bug_type', 'UNKNOWN')} error in "
+                            f"{bug_dict.get('file_path', '?')} line "
+                            f"{bug_dict.get('line_number', '?')}"
+                        )
                 
                 s_dict["formatted_bugs"] = formatted_bugs
                 data["iterations"].append(s_dict)

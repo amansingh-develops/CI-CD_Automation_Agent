@@ -54,7 +54,38 @@ def clone_repository(repo_url: str, github_token: str = "") -> str:
     dest_path = os.path.abspath(os.path.join(WORKSPACE_ROOT, repo_name))
 
     if os.path.exists(dest_path):
-        logger.info("Workspace already exists for %s at %s", repo_name, dest_path)
+        logger.info("Workspace already exists for %s at %s — resetting to clean state", repo_name, dest_path)
+        try:
+            # Fetch latest and hard-reset to origin/main (or origin/HEAD)
+            subprocess.run(
+                ["git", "fetch", "origin"],
+                cwd=dest_path, check=True, capture_output=True, text=True,
+            )
+            # Determine default branch
+            branch_result = subprocess.run(
+                ["git", "remote", "show", "origin"],
+                cwd=dest_path, capture_output=True, text=True,
+            )
+            default_branch = "main"
+            for line in branch_result.stdout.splitlines():
+                if "HEAD branch" in line:
+                    default_branch = line.split(":")[-1].strip()
+                    break
+            subprocess.run(
+                ["git", "checkout", default_branch],
+                cwd=dest_path, check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "reset", "--hard", f"origin/{default_branch}"],
+                cwd=dest_path, check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "clean", "-fd"],
+                cwd=dest_path, check=True, capture_output=True, text=True,
+            )
+            logger.info("Workspace reset to origin/%s", default_branch)
+        except Exception as exc:
+            logger.warning("Failed to reset workspace (non-fatal): %s", exc)
         return dest_path
 
     logger.info("Cloning %s into %s", repo_url, dest_path)

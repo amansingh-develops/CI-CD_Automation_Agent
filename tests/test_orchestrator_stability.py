@@ -90,6 +90,7 @@ def test_repeated_ineffective_fixes_no_commit(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push") as mock_push:
 
             # Both initial and verify runs return the SAME bugs → effectiveness = 0.0
@@ -227,6 +228,7 @@ def test_root_commit_gate_blocks_lint_fix(orchestrator, mock_fix_agent):
              patch("app.agents.orchestrator.run_in_container") as mock_exec, \
              patch("app.agents.orchestrator.parse_failure_log") as mock_parser, \
              patch.object(orchestrator.git_agent, "apply_fix", return_value=True), \
+             patch.object(orchestrator.git_agent, "checkout_branch", return_value=True), \
              patch.object(orchestrator.git_agent, "push") as mock_push:
 
             # Initial parse: both bugs
